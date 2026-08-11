@@ -386,13 +386,25 @@ make_final_job(struct objspace *objspace, VALUE obj, VALUE table)
     objspace->finalizer_jobs = job;
 }
 
+/* Carries the location computed by rb_mmtk_update_finalizer_table_i over to
+ * rb_mmtk_update_finalizer_table_replace_i, so it does not have to ask MMTk for it a
+ * second time.  st_general_foreach calls the replace callback exactly once, right after
+ * the check callback returned ST_REPLACE for the same entry, so a single slot is enough. */
+struct rb_mmtk_update_finalizer_table_data {
+    struct objspace *objspace;
+    VALUE key;
+    VALUE new_key_location;
+};
+
 static int
 rb_mmtk_update_finalizer_table_i(st_data_t key, st_data_t value, st_data_t data, int error)
 {
     MMTK_ASSERT(mmtk_is_reachable((MMTk_ObjectReference)value));
     MMTK_ASSERT(RB_BUILTIN_TYPE(value) == T_ARRAY);
 
-    struct objspace *objspace = (struct objspace *)data;
+    struct rb_mmtk_update_finalizer_table_data *iter_data =
+        (struct rb_mmtk_update_finalizer_table_data *)data;
+    struct objspace *objspace = iter_data->objspace;
 
     if (mmtk_is_reachable((MMTk_ObjectReference)key)) {
         VALUE new_key_location = rb_mmtk_call_object_closure((VALUE)key, false);
@@ -400,6 +412,9 @@ rb_mmtk_update_finalizer_table_i(st_data_t key, st_data_t value, st_data_t data,
         MMTK_ASSERT(RB_FL_TEST(new_key_location, RUBY_FL_FINALIZE));
 
         if (new_key_location != key) {
+            iter_data->key = (VALUE)key;
+            iter_data->new_key_location = new_key_location;
+
             return ST_REPLACE;
         }
     }
@@ -417,7 +432,12 @@ rb_mmtk_update_finalizer_table_i(st_data_t key, st_data_t value, st_data_t data,
 static int
 rb_mmtk_update_finalizer_table_replace_i(st_data_t *key, st_data_t *value, st_data_t data, int existing)
 {
-    *key = rb_mmtk_call_object_closure((VALUE)*key, false);
+    struct rb_mmtk_update_finalizer_table_data *iter_data =
+        (struct rb_mmtk_update_finalizer_table_data *)data;
+
+    MMTK_ASSERT((VALUE)*key == iter_data->key);
+
+    *key = (st_data_t)iter_data->new_key_location;
 
     return ST_CONTINUE;
 }
@@ -427,11 +447,17 @@ rb_mmtk_update_finalizer_table(void)
 {
     struct objspace *objspace = rb_gc_get_objspace();
 
+    struct rb_mmtk_update_finalizer_table_data iter_data = {
+        .objspace = objspace,
+        .key = 0,
+        .new_key_location = 0,
+    };
+
     st_foreach_with_replace(
         objspace->finalizer_table,
         rb_mmtk_update_finalizer_table_i,
         rb_mmtk_update_finalizer_table_replace_i,
-        (st_data_t)objspace
+        (st_data_t)&iter_data
     );
 }
 
@@ -443,15 +469,34 @@ rb_mmtk_global_tables_count(void)
 
 static inline VALUE rb_mmtk_call_object_closure(VALUE obj, bool pin);
 
+/* The location most recently computed by rb_mmtk_update_global_tables_i, so the replace
+ * callback does not have to ask MMTk for it a second time.  It is keyed by the object it
+ * was computed for because the check and replace callbacks are not paired one-to-one:
+ * Ruby walks key/value tables with vm_weak_table_foreach_weak_key, which checks the key
+ * then the value, and vm_weak_table_foreach_update_weak_key, which updates the key then
+ * the value unconditionally.  So the replace callback can run for a slot the check
+ * callback did not just visit, and must recompute in that case. */
+struct rb_mmtk_moved_cache {
+    VALUE from;
+    VALUE to;
+};
+
 static int
 rb_mmtk_update_global_tables_i(VALUE val, void *data)
 {
+    struct rb_mmtk_moved_cache *cache = (struct rb_mmtk_moved_cache *)data;
+
     if (!mmtk_is_reachable((MMTk_ObjectReference)val)) {
         return ST_DELETE;
     }
 
     // TODO: check only if in moving GC
-    if (rb_mmtk_call_object_closure(val, false) != val) {
+    VALUE new_location = rb_mmtk_call_object_closure(val, false);
+
+    cache->from = val;
+    cache->to = new_location;
+
+    if (new_location != val) {
         return ST_REPLACE;
     }
 
@@ -461,8 +506,9 @@ rb_mmtk_update_global_tables_i(VALUE val, void *data)
 static int
 rb_mmtk_update_global_tables_replace_i(VALUE *ptr, void *data)
 {
-    // TODO: cache the new location so we don't call rb_mmtk_call_object_closure twice
-    *ptr = rb_mmtk_call_object_closure(*ptr, false);
+    struct rb_mmtk_moved_cache *cache = (struct rb_mmtk_moved_cache *)data;
+
+    *ptr = *ptr == cache->from ? cache->to : rb_mmtk_call_object_closure(*ptr, false);
 
     return ST_CONTINUE;
 }
@@ -472,10 +518,13 @@ rb_mmtk_update_global_tables(int table, bool moving)
 {
     MMTK_ASSERT(table < RB_GC_VM_WEAK_TABLE_COUNT);
 
+    /* Zero is not a valid object reference, so an untouched cache never matches a slot. */
+    struct rb_mmtk_moved_cache cache = { .from = 0, .to = 0 };
+
     rb_gc_vm_weak_table_foreach(
         rb_mmtk_update_global_tables_i,
         rb_mmtk_update_global_tables_replace_i,
-        NULL,
+        &cache,
         !moving,
         (enum rb_gc_vm_weak_tables)table
     );
